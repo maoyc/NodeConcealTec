@@ -1,0 +1,32 @@
+,0.02
+nodes,4941.0
+edges,6594.0
+components,34.0
+closeness,0.07256572635380992
+betweenness,0.0004881088523842952
+clustering,0.0
+h(0) deanonymization [1],0.0
+h(0) deanonymization [2-4],0.0
+h(0) deanonymization [5-10],0.0
+h(0) deanonymization [11-20],0.0
+h(0) deanonymization [20-inf],1.0
+h(1) deanonymization [1],0.0004047763610605141
+h(1) deanonymization [2-4],0.0014167172637117992
+h(1) deanonymization [5-10],0.0028334345274235984
+h(1) deanonymization [11-20],0.0
+h(1) deanonymization [20-inf],0.9953450718478041
+h(2) deanonymization [1],0.1289742051589682
+h(2) deanonymization [2-4],0.11577684463107378
+h(2) deanonymization [5-10],0.08958208358328335
+h(2) deanonymization [11-20],0.07978404319136173
+h(2) deanonymization [20-inf],0.585882823435313
+h(3) deanonymization [1],0.4402730375426621
+h(3) deanonymization [2-4],0.23810479823328648
+h(3) deanonymization [5-10],0.12607910058221242
+h(3) deanonymization [11-20],0.07970287090945594
+h(3) deanonymization [20-inf],0.11584019273238305
+h(4) deanonymization [1],0.6646427848613641
+h(4) deanonymization [2-4],0.2434729811778992
+h(4) deanonymization [5-10],0.06759765229710585
+h(4) deanonymization [11-20],0.019024488969844162
+h(4) deanonymization [20-inf],0.005262092693786683

@@ -1,0 +1,204 @@
+import networkx as nx
+
+from matplotlib import pyplot as plt
+from six import iterkeys
+from collections import defaultdict
+from random import shuffle
+from itertools import product,permutations
+from scipy.io import loadmat
+from scipy.sparse import issparse
+import random
+import torch
+import numpy as np
+
+import torch.nn.functional as F
+from collections import namedtuple
+import exercise as KHJ
+from gensim.models import Word2Vec
+
+"""
+torch.save(net.state_dict(),path),保存训练完的网络的各层参数，weights和bias
+cora数据集无向边5278
+"""
+
+class Environment:#传递G_list，是一个{1：[],2:[]}
+    
+    def __init__(self,edges):#构造环境的时候需要传递一个model,改model为原始model,是networkx类型的边
+        self.edges_original = sorted(list(edges))
+        self.edges = sorted(list(edges))#存储的是边[(),()],(,)里面是边的两个顶点
+        self.combind_cod = self.__encode(self.edges)#存储的是组合边的索引[(,),(,)]
+        self.action_space = len(self.combind_cod)#动作可选空间
+        self.k_distribution_orignal = self.__k_shell(self.edges)
+        #print(len(self.combind_cod))
+    def __generate_graph(self,edges):#返回的是一个字典的结构存储图。__的函数是私有方法，外部实例无法访问
+        a = defaultdict(list)
+        for i in range(len(edges)):
+            a[edges[i][0]].append(edges[i][1])
+            a[edges[i][1]].append(edges[i][0])
+        return a
+    def __encode(self,edges):#[(,),(,)]边的形式
+        combind_code = []
+        for i in range(len(edges)-1):
+            for j in range(i+1,len(edges)):
+                if edges[i][0]==edges[j][0] or edges[i][0]==edges[j][1] or edges[i][1]==edges[j][0] or edges[i][1]==edges[j][1]:
+                    continue
+                combind_code.append((i,j))
+        return combind_code#存储的是组合边的索引[(,),(,)]，已经过滤掉存在公共顶点的边组合了
+    def __decode(self,edges,gens):#gens=(,),存的是准备重连边的两个边的索引。这里是攻击的方法
+        edges_copy_trans = edges[:]
+
+        e_one = edges_copy_trans[gens[0]]#第一条边（，）
+        e_two = edges_copy_trans[gens[1]]#第二条边（，）
+
+        e_one_new_cros = (e_one[0],e_two[1])
+        e_two_new_cros = (e_two[0],e_one[1])
+        e_one_new_direc = (e_one[0],e_two[0])
+        e_two_new_direc = (e_one[1],e_two[1])
+
+        cros_label = 0#等于0表示可以进行交叉重连
+        direc_label = 0#等于0表示可以顶点直连
+        for x in edges_copy_trans:
+            if set(e_one_new_cros)==set(x) or set(e_two_new_cros)==set(x):
+                e_one_new = e_one
+                e_two_new = e_two
+                cros_label = 1
+                break
+        for x in edges_copy_trans:
+            if set(e_one_new_direc)==set(x) or set(e_two_new_direc)==set(x):
+                e_one_new = e_one
+                e_two_new = e_two
+                direc_label = 1
+                break
+
+        if cros_label == 0 and direc_label == 0:
+            if random.random()<0.5:
+                e_one_new = e_one_new_cros
+                e_two_new = e_two_new_cros
+            else:
+                e_one_new = e_one_new_direc
+                e_two_new = e_two_new_direc
+        if cros_label == 0 and direc_label == 1:
+                e_one_new = e_one_new_cros
+                e_two_new = e_two_new_cros
+        if cros_label == 1 and direc_label == 0:
+                e_one_new = e_one_new_direc
+                e_two_new = e_two_new_direc
+ 
+        edges_copy_trans[gens[0]] = e_one_new 
+        edges_copy_trans[gens[1]] = e_two_new
+        return edges_copy_trans#保证不会返回不存在重复边的情况，否则容易造成度值发生变化
+    def __random_walk(self,G,path_length, alpha=0, rand=random.Random(), start=None):
+        if start:#给定起始点
+            path = [start]
+        else:
+            path = [rand.choice(list(G.keys()))]#随机选择一个作为起点
+        while len(path) < path_length:#随机游走的路径长度
+            cur = path[-1]
+            if len(G[cur]) > 0:
+                if rand.random() >= alpha:#返回一个[0,1)之间的随机数，默认alpha为0，所以只会必然执行该if。
+                    path.append(rand.choice(G[cur]))
+                else:
+                    path.append(path[0])#为啥要返回起始点
+            else:
+                break#无法游走以后就跳出来，不存在孤立节点
+        return [str(node) for node in path]#将节点转换为字符变量，节点用数字表示但是是字符变量
+    def __build_deepwalk_corpus(self,graph, num_paths=10, path_length=50, alpha=0,rand=random.Random(0)):#num_paths:每个节点随机游走的次数，path_length:随机游走的长度
+        walks = []
+        nodes = list(graph.keys())
+        for cnt in range(num_paths):
+            rand.shuffle(nodes)
+            for node in nodes:
+                walks.append(self.__random_walk(graph,path_length, rand=rand, alpha=alpha, start=node))
+        return walks#节点变成了字符，但是是数字表示
+    def __graph_embedding(self,graph,model):
+        nodes = list(graph.keys())
+        nodes = [str(i) for i in nodes]
+        sum = 0
+        for i in nodes:
+            sum = model[i]+sum
+        sum = sum/len(nodes)
+        return sum
+    def __k_shell(self,graph_copy):
+        graph=nx.Graph(graph_copy)#复制一个图
+        importance_dict=defaultdict(list)
+        k=1#初始k值
+        while len(graph.degree):#返回节点的个数[(),(),]类型，第一个是节点编号，第二个是节点的度值
+            while True:
+                level_node_list=[]
+                for item in graph.degree:#列表元祖，元组前面是节点编号，后面是节点的度
+                    if item[1]<=k:
+                        level_node_list.append(item[0])
+                graph.remove_nodes_from(level_node_list)
+                importance_dict[k].extend(level_node_list)
+                if not len(graph.degree):
+                    return importance_dict
+                if min(graph.degree,key=lambda x:x[1])[1]>k:
+                    break
+            k = min(graph.degree,key=lambda x:x[1])[1]
+        return importance_dict
+    def __accuracy(self,k_distribution_orignal,k_distribution):
+        acc_absolute = 0
+        node_number = 0
+        for key in sorted(k_distribution_orignal.keys()):
+            acc_absolute = acc_absolute+len(set(k_distribution_orignal[key]) & set(k_distribution[key]))#精度的位置放在哪里是个关键
+            node_number = node_number+len(k_distribution_orignal[key])
+        acc_attack = 1.0-acc_absolute/node_number
+        return acc_attack
+    def step(self,attack_edge_number):#返回下一个状态，这里的attack_edge_number
+        attack_combin = self.combind_cod[attack_edge_number]#（，）返回的是组合边的索引
+        self.edges = self.__decode(self.edges,attack_combin)#返回的是受攻击后的图
+        self.combind_cod = self.__encode(self.edges)#攻击后可重连边的组合发生变化
+        #self.action_space = len(self.combind_cod)#验证一下，动作空间也就是组合情况是否会发生变化
+        k_distribution = self.__k_shell(self.edges)
+        reward = self.__accuracy(self.k_distribution_orignal,k_distribution)
+        """
+        G返回的是一个字典形式的连接矩阵，主要是方便后面deepwalk进行运算。
+        """
+        graph = self.__generate_graph(self.edges)#{:[],:[]}从算法从面，从拓扑结构进行攻击，设计一个网络可预测性特别强，相关的文献，
+        walks = self.__build_deepwalk_corpus(graph)#walks为游走出来的步。每执行一次都要游走一次
+        """
+        size表示节点的嵌入向量表示，window表示窗口，workers为支持的线程,mdel为训练出的最终模型
+        """
+        model = Word2Vec(walks, size=50,window=4, min_count=0, sg=1, hs=1, workers=1)
+        graph_embedding_numpy = self.__graph_embedding(graph,model)
+        graph_embedding_tensor = torch.tensor(graph_embedding_numpy)
+        reward = torch.tensor(reward)#注意是小写的t
+        reward = reward.unsqueeze(0)
+        return graph_embedding_tensor,reward#返回图的嵌入,reward为[]形式
+    def reset(self):
+        self.edges = self.edges_original
+        self.combind_cod = self.__encode(self.edges)#存储初始可重连边的所有组合，这些边没有公共顶点
+        graph = self.__generate_graph(self.edges)#返回字典形式的连接矩阵
+        walks = self.__build_deepwalk_corpus(graph)
+        model = Word2Vec(walks, size=50,window=4, min_count=0, sg=1, hs=1, workers=1)
+        graph_embedding_numpy = self.__graph_embedding(graph,model)#要转化成float()类型的张量，原始的是np类型的
+        graph_embedding_tensor = torch.tensor(graph_embedding_numpy)#float类型
+        return graph_embedding_tensor#返回的图状态嵌入必须是张量形式，否则没法喂到深度学习网络中去
+
+
+
+
+if __name__=='__main__':
+
+    edges = [(1,9),(2,9),(3,5),(4,5),(5,6),(5,9),(6,7),(6,8),(6,9),(6,12),(7,8),(7,9),(7,12),(8,9),(8,16)
+                      ,(9,10),(9,11),(10,11),(12,13),(12,14),(14,15),(16,17),(16,18),(16,19),(16,20),(16,21),(16,22)
+                      ,(16,23),(23,24),(24,25),(24,26)]
+    #a=[1,2,3,4,5,6]
+    #a=[str(i) for i in a]
+    #print(a)
+    G = KHJ.generate_graph(edges)
+    grap = G.edges
+    #nodes = G.nodes
+    ##print(grap)
+    ##a = defaultdict(list)
+    ##for i in range(len(edges)):
+    ##    a[edges[i][0]].append(edges[i][1])
+    ##    a[edges[i][1]].append(edges[i][0])
+    ##print(a)
+    #print(sorted(nodes))
+    hjki = Environment(grap)
+    attack_graph = hjki.step(1)
+    print(attack_graph)
+    ##G = KHJ.generate_graph(attack_graph)
+    ##nx.drawing.nx_pylab.draw_networkx(G,with_labels=True)
+    ##plt.show()

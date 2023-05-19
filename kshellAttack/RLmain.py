@@ -1,0 +1,331 @@
+# -*- coding: utf-8 -*-
+# @Time : 2021/6/4 15:58
+# @Author : Mao Yongchao
+# @Site : 
+# @File : RLmain.py
+# @Software: PyCharm
+
+import numpy as np
+from collections import namedtuple
+import torch.nn as nn
+import random
+import torch
+from torch import optim
+import torch.nn.functional as F
+import environment
+from tqdm import tqdm
+import time
+import networkx as nx
+import matplotlib.pyplot as plt
+
+
+def generate_graph(edges):
+    G = nx.Graph()
+    G.add_edges_from(edges)
+    return G
+
+
+class ReplayMemory:
+
+    def __init__(self, CAPACITY):
+        self.capacity = CAPACITY  # 存储能力
+        self.memory = []  # 这是一个列表，元素是一个namedtuple
+        self.index = 0
+        self.Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward'))
+
+    def push(self, state, action, state_next, reward):
+        '''transition = (state, action, state_next, reward)をメモリに保存する'''
+        if len(self.memory) < self.capacity:
+            self.memory.append(None)
+            # namedtuple里的Transition的使用
+        self.memory[self.index] = self.Transition(state, action, state_next,
+                                                  reward)  # (state=,action=,state_next=,reward=)
+        self.index = (self.index + 1) % self.capacity  # 超出能力以后就开始从头开始存储
+
+    def sample(self, batch_size):
+        '''batch_size构造批处理的应用环境'''
+        return random.sample(self.memory, batch_size)  # 返回的形式[,,,],也是一个列表，长度为batch_size
+
+    def __len__(self):
+        '''当前存储的轨迹长度'''
+        return len(self.memory)
+
+
+"""
+q网络采用gcn网络，因此导入gcnmodel文件，gcnmodel.GcnNet()构建网络，因此有必要研究gcn的基础模型
+"""
+
+
+class Net(nn.Module):
+
+    def __init__(self, n_in, n_mid, n_out):
+        super(Net, self).__init__()
+        self.fc1 = nn.Linear(n_in, n_mid)
+        self.fc2 = nn.Linear(n_mid, n_mid)
+        self.fc3 = nn.Linear(n_mid, n_out)
+
+    def forward(self, x):
+        h1 = F.relu(self.fc1(x))
+        h2 = F.relu(self.fc2(h1))
+        output = self.fc3(h2)
+        return output
+
+
+class Brain:
+    def __init__(self, num_states, num_actions, CAPACITY, BATCH_SIZE, GAMMA):  # 图的嵌入状态维度，当前选为的长度是8.
+        self.num_actions = num_actions  # 可以执行的动作空间，应该是边的组合攻击个数，动作空间比较大但是是固定的维度。
+        self.CAPACITY = CAPACITY
+        self.BATCH_SIZE = BATCH_SIZE
+        self.GAMMA = GAMMA
+        self.Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward'))
+
+        self.memory = ReplayMemory(self.CAPACITY)
+        # num_states表示输入特征的维度，cora数据集1433，num_actions为可选边的数目
+        n_in, n_mid, n_out = num_states, 100, num_actions
+
+        self.main_q_network = Net(n_in, n_mid, n_out)  # 定期将主网络参数复制给目标网络，优化的是主网络参数
+        self.target_q_network = Net(n_in, n_mid, n_out)
+        self.optimizer = optim.Adam(self.main_q_network.parameters(), lr=0.0001)
+
+    def make_minibatch(self):
+
+        transitions = self.memory.sample(self.BATCH_SIZE)  # 结果类型如此[Transition(,,,),Transition()]
+        # batch类型为Transition(state=(),action=(),,)长度为BATCH_SIZE长度
+        batch = self.Transition(*zip(*transitions))
+
+        # print(batch.action)#([[]],[[]])形式
+        # print(batch.reward)#([[]],[[]])形式
+        # print(batch.state)
+        state_batch = torch.cat(batch.state)  # [[],[]]的形式
+        # print(state_batch)
+        action_batch = torch.cat(batch.action)  # 形式为[]
+        reward_batch = torch.cat(batch.reward)  # 形式为[[],[]]
+        non_final_next_states = torch.cat([s for s in batch.next_state if s is not None], 0)  # [[],[],[]]类型
+        # print(non_final_next_states)
+        return batch, state_batch, action_batch, reward_batch, non_final_next_states
+
+    def replay(self):
+        '''这个函数包含从经验池采集批训练数据，计算监督信息，更新主网络参数'''
+        if len(self.memory) < self.BATCH_SIZE:  # 如果经验池子存储的数据少，就返回
+            return
+
+        self.batch, self.state_batch, self.action_batch, self.reward_batch, self.non_final_next_states = self.make_minibatch()
+
+        # 3. 求取监督值
+        self.expected_state_action_values = self.get_expected_state_action_values()  # [,,,]
+
+        self.update_main_q_network()
+
+    def decide_action(self, state, episode):  # 这个fartura是暂时先采用节点的原始特征
+        epsilon = 0.5 * (1 / (episode + 1))
+        if epsilon <= np.random.uniform(0, 1):
+            self.main_q_network.eval()  # ネットワークを推論モードに切り替える
+            with torch.no_grad():
+                action = self.main_q_network(state).max(1)[1]  # 动作就是准备重连边的组合索引，为什么深度为2呢
+                action = action.unsqueeze(0)
+            # .view(1,1)は[torch.LongTensor of size 1]　を size 1x1 に変換します
+
+        else:
+
+            action = torch.LongTensor(
+                [[random.randrange(self.num_actions)]])  # action是一个张量的形式，在交互环境中是一个数字
+            # actionは[torch.LongTensor of size 1x1]の形になります
+
+        return action
+
+    def get_expected_state_action_values(self):
+
+        self.main_q_network.eval()
+        self.target_q_network.eval()
+        """
+        最小批的训练，要么就是利用循环来计算然后取平均，想办法怎么实现小批次
+        """
+        # action = torch.unsqueeze(self.action_batch,1)#变成[[],[],[]]
+        # 原始self.state_action_values的shape形式为[4,1,1],需要求梯度，gather的用法要注意。利用squeeze变成[4,1]形式，4为batchsize形式
+        self.state_action_values = self.main_q_network(self.state_batch).gather(1,
+                                                                                self.action_batch)  # 不降维操作[[],[],[],]
+        # self.state_action_values = self.state_action_values.squeeze(1)
+        # print(self.state_action_values)
+        # print(self.state_action_values.shape)
+        non_final_mask = torch.ByteTensor(tuple(map(lambda s: s is not None, self.batch.next_state)))
+        non_final_mask = non_final_mask.bool()  # 如果是空的布尔值为false,tensor([true,true,]类型
+        # print(non_final_mask)
+
+        next_state_values = torch.zeros(self.BATCH_SIZE)  # [,,]类型
+
+        a_m = torch.zeros(self.BATCH_SIZE).type(torch.LongTensor)  # [,,]类型
+        # a_m存储的动作索引，也就是边的索引
+        a_m[non_final_mask] = self.main_q_network(self.non_final_next_states).detach().max(1)[
+            1]  # [,,,],取Q值最大的动作索引，维度会比输出数据降一个维度
+        # print(a_m[non_final_mask])
+
+        a_m_non_final_next_states = a_m[non_final_mask].view(-1, 1)  # 转化成[[],[],]的形式，存储的是最大Q值得动作
+        # a_m_non_final_next_states = torch.unsqueeze(a_m_non_final_next_states,1)
+        # print(a_m_non_final_next_states)
+        # detach()用于取出张量，
+
+        # next_state_values是Qm（st+1,a）[,,,,]的形式
+        next_state_values[non_final_mask] = self.target_q_network(self.non_final_next_states).gather(1,
+                                                                                                     a_m_non_final_next_states).detach().squeeze()  # 压缩一个维度
+        # print('next_state_values:{}'.format(next_state_values))
+        reward_batch = torch.squeeze(self.reward_batch)  # 形式为[，，，]
+        expected_state_action_values = reward_batch + self.GAMMA * next_state_values
+        # print('expected_state_action_values:{}'.format(expected_state_action_values))
+        return expected_state_action_values  # [,,,]形式，将维度为1的压缩。
+
+    def update_main_q_network(self):
+
+        self.main_q_network.train()
+
+        # 4损失函数为（smooth_l1_lossはHuberloss）
+        # expected_state_action_values为[,,,]形式，利用unsqueeze变成为[minibatch x 1]，注意损失函数的格式
+        loss = F.smooth_l1_loss(self.state_action_values, self.expected_state_action_values.unsqueeze(1))
+
+        self.optimizer.zero_grad()  # 将梯度归零
+        loss.backward()  # 反向传播
+        self.optimizer.step()  # 参数更新
+
+    def update_target_q_network(self):  # DDQNで追加
+
+        self.target_q_network.load_state_dict(self.main_q_network.state_dict())
+
+    def load_parameter(self):
+        QL_parameter = self.main_q_network.state_dict()
+        return QL_parameter
+
+
+class Agent:
+    def __init__(self, num_states, num_actions, CAPACITY, BATCH_SIZE, GAMMA):
+        self.brain = Brain(num_states, num_actions, CAPACITY, BATCH_SIZE, GAMMA)  # 类里面嵌套类
+
+    def update_q_function(self):
+        self.brain.replay()  # 这里会进行参数的更新
+
+    def get_action(self, state, episode):
+        action = self.brain.decide_action(state, episode)
+        return action
+
+    def memorize(self, state, action, state_next, reward):
+        self.brain.memory.push(state, action, state_next, reward)
+
+    def update_target_q_function(self):
+        '''Target Q-NetworkをMain Q-Networkと同じに更新'''
+        self.brain.update_target_q_network()
+
+    def conserve_parameter(self):
+        net_parameter = self.brain.load_parameter()
+        return net_parameter
+
+
+class Working:
+    def __init__(self, graph, BATCH_SIZE, CAPACITY, GAMMA, MAX_STEPS, NUM_EPISODES):
+        self.env = environment.Environment(graph)  # 定义环境
+        num_states = 50  # 现针对deepwalk的嵌入
+        num_actions = self.env.action_space  # 动作可选集为边的条数
+        self.agent = Agent(num_states, num_actions, CAPACITY, BATCH_SIZE, GAMMA)
+
+        self.MAX_STEPS = MAX_STEPS
+        self.NUM_EPISODES = NUM_EPISODES
+
+    def run(self):
+        episode_final = False
+
+        for episode in tqdm(range(self.NUM_EPISODES)):  # 重复10次，相当于总共执行10×5，采用的是暴力实验的方式
+            observation = self.env.reset()  # 图的初始状态嵌入
+            state = observation.unsqueeze(0)  # 形式为[[],[],[],],长度为8，是一个张量类型，为了进行批量运算需要进行扩充
+            # print(state)
+            # print(type(state))
+            for step in range(self.MAX_STEPS):  # 训练5次
+
+                action = self.agent.get_action(state, episode)  # action形式[[]],是一个张量,LongTensor类型，gather函数需要用到这个类型
+                # print(action.type())
+                # action = action.squeeze(0)
+                # print(action)
+                # print('action=:{}'.format(action.item()))
+                observation_next, reward = self.env.step(action.item())  # item是因为agent返回的动作是张量形式。
+                state_next = observation_next.unsqueeze(0)  # 扩展批方向上的维度
+                reward = reward.unsqueeze(0)  # reward类型为[[]]形式
+                self.agent.memorize(state, action, state_next, reward)  # 此时的state已经变成一个[[]]二位的张量
+                self.agent.update_q_function()
+                state = state_next
+            if (episode % 2 == 0):
+                self.agent.update_target_q_function()
+        agent_parameter = self.agent.conserve_parameter()
+        return agent_parameter
+
+
+def QLearning_attack(edges, BATCH_SIZE=8, CAPACITY=10000, GAMMA=0.99, MAX_STEPS=10, NUM_EPISODES=10):
+    Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward'))
+    work = Working(edges, BATCH_SIZE, CAPACITY, GAMMA, MAX_STEPS, NUM_EPISODES)
+    agent_parameter = work.run()  # 训练结束将main_target的网络参数保存下来
+
+    # graph_orignal = Exise.generate_graph(edges)
+    # k_distribution_orignal = Exise.k_shell(graph_orignal)
+    # node_orignal = Exise.color_map(graph_orignal,k_distribution_orignal)
+
+    env = environment.Environment(edges)  # graph是networkx类型的边,该例子的动作空间为465
+    # print(env.action_space)
+    observation = env.reset()  # 图的初始嵌入状态,不带批次维度
+    observation = observation.unsqueeze(0)  # [[]]的形式，为了后面取值方便
+    agent_network = Net(50, 100, env.action_space)  # action_space为368
+    agent_network.load_state_dict(agent_parameter)
+    state = observation
+    for i in range(5):  # 攻击5次，也就是重连边10条
+        action = agent_network(state).max(1)[1]  # []降维了，张量类型
+        state, _ = env.step(action.item())
+        state = state.unsqueeze(0)
+
+    graph_attack = env.edges
+    return graph_attack
+
+
+if __name__ == '__main__':
+    edges = [(1, 9), (2, 9), (3, 5), (4, 5), (5, 6), (5, 9), (6, 7), (6, 8), (6, 9), (6, 12), (7, 8), (7, 9), (7, 12),
+             (8, 9), (8, 16)
+        , (9, 10), (9, 11), (10, 11), (12, 13), (12, 14), (14, 15), (16, 17), (16, 18), (16, 19), (16, 20), (16, 21),
+             (16, 22)
+        , (16, 23), (23, 24), (24, 25), (24, 26)]
+    G = Exise.generate_graph(edges)
+    edges = G.edges
+    Transition = namedtuple('Transition', ('state', 'action', 'next_state', 'reward'))
+    BATCH_SIZE = 8  # 源代码是32
+    CAPACITY = 10000
+    GAMMA = 0.99
+    MAX_STEPS = 10
+    NUM_EPISODES = 50
+    work = Working(edges)
+    agent_parameter = work.run()  # 训练结束将main_target的网络参数保存下来
+    """
+    接下来就是利用训练好的智能体进行攻击，
+    """
+
+    graph_orignal = Exise.generate_graph(edges)
+    k_distribution_orignal = Exise.k_shell(graph_orignal)
+    node_orignal = Exise.color_map(graph_orignal, k_distribution_orignal)
+
+    env = environment.Environment(edges)  # graph是networkx类型的边,该例子的动作空间为465
+    # print(env.action_space)
+    observation = env.reset()  # 图的初始嵌入状态,不带批次维度
+    observation = observation.unsqueeze(0)  # [[]]的形式，为了后面取值方便
+    agent_network = Net(50, 100, env.action_space)  # action_space为368
+    agent_network.load_state_dict(agent_parameter)
+    state = observation
+    for i in range(5):  # 攻击5次，也就是重连边10条
+        action = agent_network(state).max(1)[1]  # []降维了，张量类型
+        state, _ = env.step(action.item())
+        state = state.unsqueeze(0)
+
+    graph_attack = Exise.generate_graph(env.edges)
+    k_distribution_attack = Exise.k_shell(graph_attack)
+    node_attack = Exise.color_map(graph_attack, k_distribution_attack)
+
+    figure1 = plt.figure()
+    ax1 = figure1.add_subplot(121)
+    ax2 = figure1.add_subplot(122)
+    adg = 1.0 - Exise.accuracy(k_distribution_orignal, k_distribution_attack)
+    QL_attack_number = Exise.attack_edge_number_computation(edges, env.edges)
+    print(adg)
+    print(QL_attack_number)
+    nx.drawing.nx_pylab.draw_networkx(graph_orignal, ax=ax1, node_color=node_orignal, with_labels=True)
+    nx.drawing.nx_pylab.draw_networkx(graph_attack, ax=ax2, node_color=node_attack, with_labels=True)
+    plt.show()

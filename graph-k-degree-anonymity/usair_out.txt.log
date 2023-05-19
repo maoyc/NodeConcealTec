@@ -1,0 +1,9 @@
+Attempt number 1
+Attempt number 2
+the sequence is valid but the graph construction failed
+Attempt number 3
+Attempt number 4
+Total execution time = 0.11399579048156738
+Edges overlap = 67.35653809971778%
+Num edges original graph = 2126
+Num edges anonymised graph = 2118
